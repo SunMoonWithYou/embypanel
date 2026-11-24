@@ -1,23 +1,11 @@
 /**
- * Emby Proxy 流量监控 Worker
- * 
- * 功能：
- * 1. 接收后台上报（/collect），按「节点+日期」聚合存储到 KV
- * 2. 去重：相同 batch_id 只处理一次
- * 3. 缓存：今天/昨天/近7天 的结果预计算，只有新数据才更新缓存
- * 4. 提供前端看板（/），支持节点筛选、时间范围、自定义日期
- * 5. 隐私处理：主机和 IP 脱敏显示
- * 
- * 需要绑定：
- * - KV 命名空间：REPORTS
- * - 可选环境变量：REPORT_TOKEN（上报鉴权）
+ * Emby Proxy 流量监控 Worker（下拉对齐修复）
  */
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 跨域预检
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -28,22 +16,18 @@ export default {
       });
     }
 
-    // 接收上报
     if (url.pathname === "/collect" && request.method === "POST") {
       return handleCollect(request, env);
     }
 
-    // 查询统计数据
     if (url.pathname === "/api/stats" && request.method === "GET") {
       return handleStats(url, env);
     }
 
-    // 查询节点列表
     if (url.pathname === "/api/nodes" && request.method === "GET") {
       return handleNodes(env);
     }
 
-    // 前端页面
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(HTML, {
         headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -54,9 +38,6 @@ export default {
   },
 };
 
-// ==================== 隐私脱敏工具 ====================
-
-/** 对单个标签脱敏：首尾保留，中间变*，单字符直接* */
 function privacyLabel(s) {
   if (!s) return s;
   const len = s.length;
@@ -65,14 +46,12 @@ function privacyLabel(s) {
   return s[0] + "*".repeat(len - 2) + s[len - 1];
 }
 
-/** 主机脱敏：按点分割，每段单独脱敏 */
 function privacyHost(host) {
   if (!host) return host;
   host = host.split(":")[0].toLowerCase();
   return host.split(".").map(privacyLabel).join(".");
 }
 
-/** IP 脱敏：IPv4 保留前两段，IPv6 保留首尾 */
 function privacyIP(ip) {
   if (!ip) return ip;
   if (ip.includes(".") && !ip.includes(":")) {
@@ -90,14 +69,12 @@ function privacyIP(ip) {
   return ip;
 }
 
-/** 统一返回 JSON */
 function json(data) {
   return new Response(JSON.stringify(data), {
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
 
-/** 合并计数 map，可选脱敏函数 */
 function mergeMap(target, source, maskFn) {
   if (!source) return;
   for (const [k, v] of Object.entries(source)) {
@@ -106,18 +83,7 @@ function mergeMap(target, source, maskFn) {
   }
 }
 
-// ==================== 接收上报 ====================
-
-/**
- * 处理上报：
- * 1. 鉴权（可选）
- * 2. 用 batch_id 去重
- * 3. 按节点+日期聚合到 agg:{node}:{date}
- * 4. 更新节点索引
- * 5. 刷新常用范围缓存
- */
 async function handleCollect(request, env) {
-  // 可选鉴权
   const token = env.REPORT_TOKEN || "";
   if (token) {
     const auth = request.headers.get("Authorization") || "";
@@ -153,7 +119,6 @@ async function handleCollect(request, env) {
     });
   }
 
-  // 去重：相同 batch_id 直接跳过
   const seenKey = `seen:${payload.batch_id}`;
   const already = await env.REPORTS.get(seenKey);
   if (already) {
@@ -168,7 +133,6 @@ async function handleCollect(request, env) {
   const hour = payload.period_hour || "daily";
   const isDaily = hour === "daily";
 
-  // 读取当天聚合对象
   const aggKey = `agg:${nodeKey}:${date}`;
   let agg = {};
   const raw = await env.REPORTS.get(aggKey);
@@ -176,7 +140,6 @@ async function handleCollect(request, env) {
     try { agg = JSON.parse(raw); } catch {}
   }
 
-  // 初始化结构
   if (!agg.date) {
     agg = {
       date,
@@ -194,14 +157,12 @@ async function handleCollect(request, env) {
     };
   }
 
-  // 累加总量
   agg.requests += payload.requests || 0;
   agg.up_bytes += payload.up_bytes || 0;
   agg.down_bytes += payload.down_bytes || 0;
   agg.blocked += payload.blocked || 0;
   agg.note = nodeNote;
 
-  // 小时明细（日报不写入）
   if (!isDaily) {
     const h = String(hour).padStart(2, "0");
     if (!agg.hours[h]) agg.hours[h] = { requests: 0, up: 0, down: 0, blocked: 0 };
@@ -211,13 +172,11 @@ async function handleCollect(request, env) {
     agg.hours[h].blocked += payload.blocked || 0;
   }
 
-  // 合并排行（已脱敏）
   mergeMap(agg.hosts, payload.hosts, privacyHost);
   mergeMap(agg.ips, payload.ips, privacyIP);
   mergeMap(agg.countries, payload.countries);
   mergeMap(agg.provinces, payload.provinces);
 
-  // 限制排行大小，避免单 key 过大
   function prune(map, n = 40) {
     const entries = Object.entries(map).sort((a, b) => b[1] - a[1]);
     if (entries.length <= n) return map;
@@ -228,20 +187,15 @@ async function handleCollect(request, env) {
   agg.countries = prune(agg.countries, 20);
   agg.provinces = prune(agg.provinces, 30);
 
-  // 写入聚合（保留 90 天）
   await env.REPORTS.put(aggKey, JSON.stringify(agg), {
     expirationTtl: 60 * 60 * 24 * 90,
   });
 
-  // 标记已处理（7 天过期）
   await env.REPORTS.put(seenKey, "1", {
     expirationTtl: 60 * 60 * 24 * 7,
   });
 
-  // 更新节点索引
   await updateNodeIndex(env, nodeKey, nodeNote);
-
-  // 新数据到达，刷新常用缓存
   await updateReadyCache(env, "today");
   await updateReadyCache(env, "yesterday");
   await updateReadyCache(env, "7d");
@@ -251,7 +205,6 @@ async function handleCollect(request, env) {
   });
 }
 
-/** 更新节点索引（用于前端下拉框） */
 async function updateNodeIndex(env, nodeKey, note) {
   const raw = await env.REPORTS.get("nodes:index");
   let nodes = {};
@@ -262,7 +215,6 @@ async function updateNodeIndex(env, nodeKey, note) {
   await env.REPORTS.put("nodes:index", JSON.stringify(nodes));
 }
 
-/** 预计算并缓存常用范围（今天/昨天/7天） */
 async function updateReadyCache(env, range) {
   try {
     const data = await computeStats(env, range, "");
@@ -273,9 +225,6 @@ async function updateReadyCache(env, range) {
   } catch (e) {}
 }
 
-// ==================== API ====================
-
-/** 返回节点列表 */
 async function handleNodes(env) {
   if (!env.REPORTS) return json({ nodes: {} });
   const raw = await env.REPORTS.get("nodes:index");
@@ -286,11 +235,6 @@ async function handleNodes(env) {
   return json({ nodes });
 }
 
-/**
- * 查询统计：
- * - 常用范围（今天/昨天/7天）+ 全部节点：优先读缓存
- * - 其他情况实时计算
- */
 async function handleStats(url, env) {
   if (!env.REPORTS) {
     return json({ error: "KV not bound", summary: {}, series: [], top_hosts: [], top_ips: [], top_countries: [], top_provinces: [] });
@@ -301,7 +245,6 @@ async function handleStats(url, env) {
   const customStart = url.searchParams.get("start") || "";
   const customEnd = url.searchParams.get("end") || "";
 
-  // 优先读缓存
   if (!customStart && !node && ["today", "yesterday", "7d"].includes(range)) {
     const cached = await env.REPORTS.get(`ready:${range}:all`);
     if (cached) {
@@ -311,18 +254,10 @@ async function handleStats(url, env) {
     }
   }
 
-  // 实时计算
   const data = await computeStats(env, range, node, customStart, customEnd);
   return json(data);
 }
 
-/**
- * 核心统计计算：
- * 1. 根据范围算出日期列表
- * 2. 拉取对应节点+日期的聚合数据
- * 3. 汇总请求、流量、小时序列、排行
- * 4. 单天时补全 24 小时（缺的为 0）
- */
 async function computeStats(env, range, node, customStart = "", customEnd = "") {
   const now = new Date();
   const bj = new Date(now.getTime() + 8 * 3600 * 1000);
@@ -350,7 +285,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
     endDate = formatDate(bj);
   }
 
-  // 生成日期列表
   const dates = [];
   let cur = new Date(startDate + "T00:00:00Z");
   const end = new Date(endDate + "T00:00:00Z");
@@ -359,7 +293,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
     cur.setDate(cur.getDate() + 1);
   }
 
-  // 确定要查的节点
   let nodeKeys = [];
   if (node) {
     nodeKeys = [node];
@@ -373,7 +306,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
     }
   }
 
-  // 拉取聚合数据
   const aggs = [];
   for (const nk of nodeKeys) {
     for (const d of dates) {
@@ -384,7 +316,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
     }
   }
 
-  // 汇总
   let totalRequests = 0, totalUp = 0, totalDown = 0, totalBlocked = 0;
   const ipSet = new Set();
   const hourly = {};
@@ -399,7 +330,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
     totalDown += a.down_bytes || 0;
     totalBlocked += a.blocked || 0;
 
-    // 小时序列
     if (a.hours) {
       for (const [h, v] of Object.entries(a.hours)) {
         const key = `${a.date} ${h}`;
@@ -421,10 +351,8 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
     }
   }
 
-  // 生成图表序列
   const series = [];
   if (dates.length === 1) {
-    // 单天：补全 24 小时
     const d = dates[0];
     for (let h = 0; h < 24; h++) {
       const hh = String(h).padStart(2, "0");
@@ -440,7 +368,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
       });
     }
   } else {
-    // 多天：按有数据的小时显示
     Object.entries(hourly)
       .sort(([a], [b]) => a.localeCompare(b))
       .forEach(([k, v]) => {
@@ -455,7 +382,6 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
       });
   }
 
-  // 排行
   const topHosts = Object.entries(hosts).sort((a, b) => b[1] - a[1]).slice(0, 50);
   const topIPList = Object.entries(topIPs).sort((a, b) => b[1] - a[1]).slice(0, 50);
   const topCountries = Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 30);
@@ -483,30 +409,29 @@ async function computeStats(env, range, node, customStart = "", customEnd = "") 
   };
 }
 
-// ==================== 前端页面 ====================
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>流量监控</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%233b82f6'/><path d='M20 70 L35 45 L50 60 L65 30 L80 50' stroke='white' stroke-width='8' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%233b82f6'/><path d='M18 72 L34 44 L50 58 L66 26 L82 50' stroke='white' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root {
-  --bg: #f0f4f8;
+  --bg: #f4f7fb;
   --card: #ffffff;
-  --bd: #e2e8f0;
-  --t: #1e293b;
+  --bd: #e6edf5;
+  --t: #0f172a;
   --t2: #475569;
   --t3: #94a3b8;
   --p: #3b82f6;
-  --shadow: 0 4px 12px -2px rgba(15, 23, 42, 0.08);
+  --shadow: 0 2px 8px -2px rgba(15, 23, 42, 0.06);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  background: linear-gradient(180deg, #f8fafc 0%, #f0f4f8 100%);
+  background: #f4f7fb;
   color: var(--t);
   min-height: 100vh;
 }
@@ -514,212 +439,151 @@ body {
   background: rgba(255,255,255,0.95);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--bd);
-  padding: 12px 16px;
+  padding: 8px 16px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   position: sticky;
   top: 0;
   z-index: 20;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.04);
 }
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
+.header-left { display: flex; align-items: center; gap: 8px; }
 .header-left .icon {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  background: #3b82f6;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
+  width: 28px; height: 28px; border-radius: 7px;
+  background: linear-gradient(135deg, #3b82f6, #60a5fa);
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
 }
-.header-left h1 { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
-.header-left .sub { font-size: 11px; color: var(--t3); margin-top: 1px; }
-.node-select {
-  padding: 6px 10px 6px 12px;
-  border: 1px solid #d1d5db;
+.header-left h1 { font-size: 15px; font-weight: 700; }
+.header-left .sub { font-size: 10px; color: var(--t3); }
+.node-dropdown { position: relative; }
+.node-btn {
+  padding: 6px 28px 6px 12px;
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
-  font-size: 13px;
-  background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") no-repeat right 8px center;
+  font-size: 12.5px;
+  background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2.5'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") no-repeat right 8px center;
   background-size: 12px;
-  appearance: none;
-  min-width: 110px;
+  min-width: 130px;
   color: var(--t);
   box-shadow: 0 1px 2px rgba(0,0,0,0.04);
   cursor: pointer;
+  text-align: left;
 }
-.node-select:hover { border-color: #94a3b8; }
-.node-select:focus { outline: none; border-color: var(--p); box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
-.container { padding: 14px 12px 32px; max-width: 1600px; margin: 0 auto; }
-.filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 14px;
-}
-.tabs {
-  display: flex;
-  gap: 4px;
+.node-btn:hover { border-color: #cbd5e1; }
+.node-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
   background: #fff;
-  padding: 4px;
-  border-radius: 10px;
-  border: 1px solid var(--bd);
-  box-shadow: var(--shadow);
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  max-width: 100%;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px -2px rgba(15,23,42,0.12);
+  min-width: 100%;
+  z-index: 30;
+  overflow: hidden;
+}
+.node-menu.show { display: block; }
+.node-item {
+  padding: 7px 12px;
+  font-size: 12.5px;
+  color: var(--t);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.node-item:hover { background: #f1f5f9; }
+.node-item.active { background: #3b82f6; color: #fff; }
+.container { padding: 10px 12px 24px; width: 100%; }
+.filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.tabs {
+  display: flex; gap: 2px; background: #fff; padding: 3px;
+  border-radius: 8px; border: 1px solid var(--bd); box-shadow: var(--shadow);
+  overflow-x: auto; scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar { display: none; }
 .tab {
-  padding: 6px 12px;
-  border-radius: 7px;
-  font-size: 13px;
-  cursor: pointer;
-  color: var(--t2);
-  border: none;
-  background: transparent;
-  transition: all 0.15s;
-  white-space: nowrap;
-  flex-shrink: 0;
+  padding: 4px 12px; border-radius: 6px; font-size: 12px;
+  cursor: pointer; color: var(--t2); border: none; background: transparent;
+  white-space: nowrap; flex-shrink: 0;
 }
-.tab.active { background: var(--p); color: #fff; font-weight: 600; }
+.tab.active { background: #3b82f6; color: #fff; font-weight: 600; }
 .date-filter {
-  display: none;
-  align-items: center;
-  gap: 6px;
-  background: #fff;
-  padding: 4px 8px;
-  border-radius: 10px;
-  border: 1px solid var(--bd);
-  box-shadow: var(--shadow);
+  display: none; align-items: center; gap: 4px;
+  background: #fff; padding: 3px 6px; border-radius: 8px;
+  border: 1px solid var(--bd); box-shadow: var(--shadow);
 }
 .date-filter.show { display: flex; }
 .date-filter input[type="date"] {
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 5px 8px;
-  font-size: 13px;
-  color: var(--t);
+  border: 1px solid #e2e8f0; border-radius: 5px; padding: 3px 6px; font-size: 12px;
 }
 .date-filter button {
-  background: var(--p);
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  padding: 6px 12px;
-  font-size: 13px;
-  cursor: pointer;
-  font-weight: 500;
+  background: #3b82f6; color: #fff; border: none; border-radius: 5px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
 }
-.date-filter button:hover { background: #2563eb; }
 .cards {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  margin-bottom: 14px;
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 10px; margin-bottom: 10px;
 }
-@media (max-width: 1100px) { .cards { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 600px) { .cards { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .cards { grid-template-columns: 1fr 1fr; } }
 .card {
-  background: var(--card);
-  border: 1px solid var(--bd);
-  border-radius: 12px;
-  padding: 14px 16px;
-  position: relative;
-  box-shadow: var(--shadow);
-  transition: transform 0.15s, box-shadow 0.15s;
+  background: var(--card); border: 1px solid var(--bd); border-radius: 10px;
+  padding: 10px 14px; position: relative; box-shadow: var(--shadow);
 }
-.card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px -4px rgba(15,23,42,0.12); }
 .card::before {
-  content: "";
-  position: absolute;
-  left: 0; top: 0; bottom: 0;
-  width: 4px;
-  border-radius: 12px 0 0 12px;
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; border-radius: 10px 0 0 10px;
 }
-.card.req::before { background: linear-gradient(180deg, #3b82f6, #60a5fa); }
-.card.traffic::before { background: linear-gradient(180deg, #10b981, #34d399); }
-.card.ip::before { background: linear-gradient(180deg, #f59e0b, #fbbf24); }
-.card.block::before { background: linear-gradient(180deg, #ef4444, #f87171); }
-.card .label { font-size: 12px; color: var(--t3); margin-bottom: 4px; font-weight: 500; }
-.card .value { font-size: 22px; font-weight: 750; letter-spacing: -0.5px; }
-.card .sub { font-size: 11px; color: var(--t2); margin-top: 4px; }
+.card.req::before { background: #3b82f6; }
+.card.traffic::before { background: #10b981; }
+.card.ip::before { background: #f59e0b; }
+.card.block::before { background: #ef4444; }
+.card .label { font-size: 11px; color: var(--t3); margin-bottom: 2px; }
+.card .value { font-size: 20px; font-weight: 700; }
+.card .sub { font-size: 10.5px; color: var(--t2); margin-top: 2px; }
 .chart-card {
-  background: var(--card);
-  border: 1px solid var(--bd);
-  border-radius: 12px;
-  padding: 14px 14px 10px;
-  margin-bottom: 12px;
-  box-shadow: var(--shadow);
+  background: var(--card); border: 1px solid var(--bd); border-radius: 10px;
+  padding: 10px 14px 6px; margin-bottom: 10px; box-shadow: var(--shadow);
 }
-.chart-card h3 { font-size: 14px; font-weight: 650; margin-bottom: 2px; }
-.chart-card .desc { font-size: 11.5px; color: var(--t3); margin-bottom: 8px; }
-.chart-wrap { height: 180px; position: relative; }
+.chart-card h3 { font-size: 13px; font-weight: 650; margin-bottom: 1px; }
+.chart-card .desc { font-size: 11px; color: var(--t3); margin-bottom: 6px; }
+.chart-wrap { height: 150px; position: relative; }
 .tables {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  align-items: stretch;
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 10px; align-items: stretch;
 }
-@media (max-width: 1200px) { .tables { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1100px) { .tables { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 680px) { .tables { grid-template-columns: 1fr; } }
 .table-card {
-  background: var(--card);
-  border: 1px solid var(--bd);
-  border-radius: 12px;
-  padding: 12px 14px 10px;
-  box-shadow: var(--shadow);
-  display: flex;
-  flex-direction: column;
-  height: 100%;
+  background: var(--card); border: 1px solid var(--bd); border-radius: 10px;
+  padding: 8px 12px 6px; box-shadow: var(--shadow);
+  display: flex; flex-direction: column; height: 100%;
 }
-.table-card h3 { font-size: 13px; font-weight: 650; margin-bottom: 8px; color: var(--t); flex-shrink: 0; }
-.table-card table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-th, td { text-align: left; padding: 5px 4px; border-bottom: 1px solid #f1f5f9; }
-th { color: var(--t3); font-weight: 500; font-size: 11.5px; }
+.table-card h3 { font-size: 12.5px; font-weight: 650; margin-bottom: 4px; flex-shrink: 0; }
+.table-card table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { text-align: left; padding: 3px 2px; border-bottom: 1px solid #f1f5f9; }
+th { color: var(--t3); font-weight: 500; font-size: 11px; }
 tr:last-child td { border-bottom: none; }
 .pager {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  margin-top: auto;
-  padding-top: 10px;
-  font-size: 12px;
-  color: var(--t3);
-  white-space: nowrap;
-  border-top: 1px solid #f1f5f9;
-  flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  gap: 6px; margin-top: auto; padding-top: 6px;
+  font-size: 11px; color: var(--t3); white-space: nowrap;
+  border-top: 1px solid #f1f5f9; flex-shrink: 0;
 }
 .pager button {
-  padding: 3px 8px;
-  border: 1px solid var(--bd);
-  background: #fff;
-  border-radius: 5px;
-  cursor: pointer;
-  font-size: 11.5px;
-  color: var(--t2);
-  min-width: 52px;
+  padding: 2px 6px; border: 1px solid var(--bd); background: #fff;
+  border-radius: 4px; cursor: pointer; font-size: 11px; color: var(--t2); min-width: 46px;
 }
 .pager button:disabled { opacity: 0.35; cursor: not-allowed; }
-.pager button:hover:not(:disabled) { background: #f8fafc; }
-.pager .page-info { min-width: 48px; text-align: center; font-variant-numeric: tabular-nums; }
-.loading { text-align: center; padding: 60px 20px; color: var(--t3); font-size: 14px; }
+.pager .page-info { min-width: 40px; text-align: center; }
+.loading { text-align: center; padding: 40px 20px; color: var(--t3); font-size: 13px; }
 </style>
 </head>
 <body>
 <div class="header">
   <div class="header-left">
     <div class="icon">
-      <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
-        <path d="M15 75 L32 42 L48 58 L65 28 L85 52" stroke="white" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <svg width="16" height="16" viewBox="0 0 100 100" fill="none">
+        <path d="M16 74 L34 42 L50 58 L66 26 L84 50" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
     </div>
     <div>
@@ -727,7 +591,12 @@ tr:last-child td { border-bottom: none; }
       <div class="sub">Emby Proxy 数据看板</div>
     </div>
   </div>
-  <select id="nodeSelect" class="node-select"><option value="">全部节点</option></select>
+  <div class="node-dropdown">
+    <button class="node-btn" id="nodeBtn">全部节点</button>
+    <div class="node-menu" id="nodeMenu">
+      <div class="node-item active" data-value="">全部节点</div>
+    </div>
+  </div>
 </div>
 <div class="container">
   <div class="filter-bar">
@@ -789,7 +658,6 @@ tr:last-child td { border-bottom: none; }
   </div>
 </div>
 <script>
-// ========== 前端逻辑 ==========
 let trafficChart, reqChart;
 let currentRange = "today";
 let currentNode = "";
@@ -803,12 +671,28 @@ const tableState = {
   provinces: { data: [], page: 0 },
 };
 
-// 初始化日期选择器
 const today = new Date().toISOString().slice(0, 10);
 document.getElementById("startDate").value = today;
 document.getElementById("endDate").value = today;
 
-// 标签切换
+const nodeBtn = document.getElementById("nodeBtn");
+const nodeMenu = document.getElementById("nodeMenu");
+nodeBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  nodeMenu.classList.toggle("show");
+});
+document.addEventListener("click", () => nodeMenu.classList.remove("show"));
+nodeMenu.addEventListener("click", (e) => {
+  const item = e.target.closest(".node-item");
+  if (!item) return;
+  currentNode = item.dataset.value || "";
+  nodeBtn.textContent = item.textContent;
+  nodeMenu.querySelectorAll(".node-item").forEach(el => el.classList.remove("active"));
+  item.classList.add("active");
+  nodeMenu.classList.remove("show");
+  loadData();
+});
+
 document.getElementById("tabs").addEventListener("click", e => {
   if (e.target.classList.contains("tab")) {
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
@@ -826,13 +710,6 @@ document.getElementById("tabs").addEventListener("click", e => {
   }
 });
 
-// 节点切换
-document.getElementById("nodeSelect").addEventListener("change", e => {
-  currentNode = e.target.value;
-  loadData();
-});
-
-// 自定义日期查询
 function loadCustom() {
   const s = document.getElementById("startDate").value;
   const e = document.getElementById("endDate").value;
@@ -843,7 +720,6 @@ function loadCustom() {
   loadData();
 }
 
-// 字节格式化
 function formatBytes(b) {
   if (b >= 1e12) return (b / 1e12).toFixed(2) + " TB";
   if (b >= 1e9) return (b / 1e9).toFixed(2) + " GB";
@@ -851,7 +727,6 @@ function formatBytes(b) {
   return (b / 1e3).toFixed(1) + " KB";
 }
 
-// 渲染单个表格 + 分页
 function renderTable(key, tbodyId, pagerId) {
   const state = tableState[key];
   const data = state.data || [];
@@ -872,7 +747,6 @@ function renderTable(key, tbodyId, pagerId) {
   \`;
 }
 
-// 翻页
 function changePage(key, delta) {
   const state = tableState[key];
   const totalPages = Math.max(1, Math.ceil(state.data.length / PAGE_SIZE));
@@ -882,22 +756,21 @@ function changePage(key, delta) {
 }
 window.changePage = changePage;
 
-// 加载节点列表
 async function loadNodes() {
   try {
     const r = await fetch("/api/nodes");
     const data = await r.json();
-    const sel = document.getElementById("nodeSelect");
+    const menu = document.getElementById("nodeMenu");
     Object.entries(data.nodes || {}).forEach(([k, v]) => {
-      const opt = document.createElement("option");
-      opt.value = k;
-      opt.textContent = v.note || k;
-      sel.appendChild(opt);
+      const div = document.createElement("div");
+      div.className = "node-item";
+      div.dataset.value = k;
+      div.textContent = v.note || k;
+      menu.appendChild(div);
     });
   } catch (e) {}
 }
 
-// 加载统计数据
 async function loadData() {
   document.getElementById("loading").style.display = "block";
   document.getElementById("content").style.display = "none";
@@ -915,7 +788,6 @@ async function loadData() {
   }
 }
 
-// 渲染页面
 function render(data) {
   const s = data.summary || {};
   document.getElementById("vRequests").textContent = (s.requests || 0).toLocaleString();
@@ -928,7 +800,6 @@ function render(data) {
   const trafficData = (data.series || []).map(x => ((x.traffic || 0) / 1e9).toFixed(2));
   const reqData = (data.series || []).map(x => x.requests);
 
-  // 流量图
   if (trafficChart) trafficChart.destroy();
   trafficChart = new Chart(document.getElementById("trafficChart"), {
     type: "line",
@@ -938,9 +809,9 @@ function render(data) {
         label: "流量 (GB)",
         data: trafficData,
         borderColor: "#10b981",
-        backgroundColor: "rgba(16,185,129,0.18)",
+        backgroundColor: "rgba(16,185,129,0.12)",
         fill: true,
-        tension: 0.35,
+        tension: 0.4,
         pointRadius: 0,
         pointHoverRadius: 4,
         borderWidth: 2
@@ -953,21 +824,19 @@ function render(data) {
       plugins: {
         legend: { display: false },
         tooltip: {
-          callbacks: {
-            label: function(ctx) {
-              return "流量: " + ctx.parsed.y + " GB";
-            }
-          }
+          backgroundColor: "#0f172a",
+          padding: 8,
+          cornerRadius: 6,
+          callbacks: { label: ctx => "流量: " + ctx.parsed.y + " GB" }
         }
       },
       scales: {
-        y: { beginAtZero: true, grid: { color: "#f1f5f9" } },
-        x: { grid: { display: false } }
+        y: { beginAtZero: true, grid: { color: "#f1f5f9" }, ticks: { color: "#94a3b8", font: { size: 10 } } },
+        x: { grid: { display: false }, ticks: { color: "#94a3b8", font: { size: 10 }, maxRotation: 0 } }
       }
     }
   });
 
-  // 请求图
   if (reqChart) reqChart.destroy();
   reqChart = new Chart(document.getElementById("reqChart"), {
     type: "line",
@@ -977,9 +846,9 @@ function render(data) {
         label: "请求数",
         data: reqData,
         borderColor: "#3b82f6",
-        backgroundColor: "rgba(59,130,246,0.18)",
+        backgroundColor: "rgba(59,130,246,0.12)",
         fill: true,
-        tension: 0.35,
+        tension: 0.4,
         pointRadius: 0,
         pointHoverRadius: 4,
         borderWidth: 2
@@ -992,21 +861,19 @@ function render(data) {
       plugins: {
         legend: { display: false },
         tooltip: {
-          callbacks: {
-            label: function(ctx) {
-              return "请求: " + ctx.parsed.y.toLocaleString();
-            }
-          }
+          backgroundColor: "#0f172a",
+          padding: 8,
+          cornerRadius: 6,
+          callbacks: { label: ctx => "请求: " + ctx.parsed.y.toLocaleString() }
         }
       },
       scales: {
-        y: { beginAtZero: true, grid: { color: "#f1f5f9" } },
-        x: { grid: { display: false } }
+        y: { beginAtZero: true, grid: { color: "#f1f5f9" }, ticks: { color: "#94a3b8", font: { size: 10 } } },
+        x: { grid: { display: false }, ticks: { color: "#94a3b8", font: { size: 10 }, maxRotation: 0 } }
       }
     }
   });
 
-  // 表格数据
   tableState.hosts = { data: data.top_hosts || [], page: 0 };
   tableState.ips = { data: data.top_ips || [], page: 0 };
   tableState.countries = { data: data.top_countries || [], page: 0 };
@@ -1021,7 +888,6 @@ function render(data) {
   document.getElementById("content").style.display = "block";
 }
 
-// 初始化
 loadNodes();
 loadData();
 </script>
