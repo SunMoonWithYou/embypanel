@@ -517,10 +517,12 @@ const HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>流量看板</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%233b82f6'/><path d='M50 55 L72 33' stroke='white' stroke-width='10' stroke-linecap='round'/><path d='M22 78 A 34 34 0 1 1 78 78' stroke='white' stroke-width='10' fill='none' stroke-linecap='round'/></svg>">
 <script>(function(){try{var t=localStorage.getItem("theme");if(!t)t=(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";document.documentElement.setAttribute("data-theme",t);}catch(e){}})();</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
 :root{
   --bg:#f5f7fb; --bg2:#eef2f9;
@@ -866,6 +868,85 @@ body{
 @media (max-width:420px){
   .cards,.sk-cards{grid-template-columns:1fr}
 }
+/* ---------- 地图弹窗 ---------- */
+.modal{
+  display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;
+  background:rgba(15,23,42,.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  align-items:center;justify-content:center;padding:20px;
+}
+.modal.show{display:flex}
+.modal-content{
+  position:relative;
+  background:var(--card-solid);
+  border:1px solid var(--bd);
+  border-radius:24px;
+  width:min(1100px, 96vw);
+  height:min(780px, 92vh);
+  padding:18px 20px 14px;
+  box-shadow:0 30px 60px -15px rgba(15,23,42,.4), 0 0 0 1px rgba(255,255,255,.05) inset;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+}
+.modal-hd{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:8px;padding-bottom:10px;
+  border-bottom:1px solid var(--bd);
+}
+.modal-hd h3{
+  font-size:17px;font-weight:650;letter-spacing:.3px;
+  display:flex;align-items:center;gap:8px;
+}
+.modal-hd h3::before{
+  content:"";width:8px;height:8px;border-radius:50%;
+  background:linear-gradient(135deg,#f59e0b,#fbbf24);
+  box-shadow:0 0 0 3px rgba(245,158,11,.18);
+}
+.close{
+  width:36px;height:36px;border-radius:12px;display:grid;place-items:center;
+  font-size:20px;line-height:1;cursor:pointer;color:var(--t2);
+  background:transparent;transition:.18s;
+}
+.close:hover{background:var(--hover);color:var(--t);transform:rotate(90deg)}
+#mapChart{
+  flex:1;min-height:0;width:100%;
+  border-radius:16px;
+  background:#f8fafc;
+  border:1px solid var(--bd);
+  overflow:hidden;
+}
+[data-theme="dark"] #mapChart{
+  background:#0f172a;
+  border-color:#1e293b;
+}
+.map-loading,.map-empty{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;
+  height:100%;color:var(--t3);font-size:14px;
+}
+.map-loading::before{
+  content:"";width:28px;height:28px;border-radius:50%;
+  border:3px solid var(--bd2);border-top-color:#f59e0b;
+  animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* 手机端优化 */
+@media (max-width:720px){
+  .modal{padding:0}
+  .modal-content{
+    width:100%;height:100%;
+    max-width:none;max-height:none;
+    border-radius:0;
+    padding:12px 12px 8px;
+    border:none;
+  }
+  .modal-hd{margin-bottom:6px;padding-bottom:8px}
+  .modal-hd h3{font-size:16px}
+  .modal-hd span{display:none}
+  .close{width:40px;height:40px;font-size:22px}
+  #mapChart{border-radius:12px}
+}
+
 </style>
 </head>
 <body>
@@ -981,7 +1062,7 @@ body{
         <div class="pager" id="pagerIPs"></div>
       </div>
       <div class="table-card tc-regions">
-        <h3>地区分布</h3><div class="desc">点击「中国」展开省份</div>
+        <h3>地区分布</h3><div class="desc">点击国家查看地图分布</div>
         <div class="bar-list" id="tbRegions"></div>
       </div>
       <div class="table-card tc-clients">
@@ -990,6 +1071,20 @@ body{
         <div class="pager" id="pagerClients"></div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- 地图弹窗 -->
+<div class="modal" id="mapModal">
+  <div class="modal-content">
+    <div class="modal-hd">
+      <div style="display:flex;align-items:center;gap:10px">
+        <h3 id="mapTitle">中国 地区分布</h3>
+        <span style="font-size:12px;color:var(--t3);font-weight:400">省份请求热力 · 可缩放拖拽</span>
+      </div>
+      <span class="close" onclick="closeMapModal()">&times;</span>
+    </div>
+    <div id="mapChart"></div>
   </div>
 </div>
 
@@ -1009,7 +1104,12 @@ document.getElementById("themeBtn").addEventListener("click", () => {
   const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", next);
   try { localStorage.setItem("theme", next); } catch (e) {}
-  if (lastData) render(lastData); // 图表配色跟随主题重绘
+  if (lastData) render(lastData);
+  // 如果地图弹窗开着，重新加载以适配主题
+  if (document.getElementById("mapModal").classList.contains("show")) {
+    const title = document.getElementById("mapTitle").textContent || "";
+    if (title.includes("中国")) loadChinaMap();
+  }
 });
 
 // ==================== 节点选择器 ====================
@@ -1113,7 +1213,7 @@ function changePage(key, delta) {
 }
 window.changePage = changePage;
 
-/** 渲染地区分布（中国可展开省份） */
+/** 渲染地区分布（点击国家打开地图弹窗） */
 function renderRegions() {
   const list = document.getElementById("tbRegions");
   const countries = regionCountries || [], provinces = regionProvinces || [];
@@ -1121,43 +1221,160 @@ function renderRegions() {
 
   const total = countries.reduce((s, x) => s + x[1], 0) || 1;
   const maxC = Math.max(...countries.map(x => x[1]), 1);
-  const maxP = provinces.length ? Math.max(...provinces.map(x => x[1]), 1) : 1;
   let html = "";
 
   countries.forEach(([name, v], i) => {
     const idx = i + 1;
     const pct = (v / total * 100).toFixed(1);
     const width = Math.max(3, (v / maxC) * 100);
-    const canExpand = name === "中国" && provinces.length > 0;
-    const arrow = canExpand ? (regionExpanded ? "▾ " : "▸ ") : "";
-    const cls = canExpand ? "clickable" : "";
-    const click = canExpand ? "toggleRegion()" : "";
-    html += \`<div class="bar-item">
+    const canMap = name === "中国" && provinces.length > 0;
+    const cls = canMap ? "clickable" : "";
+    const click = canMap ? "openMapModal('" + name.replace(/'/g, "\\'") + "')" : "";
+    html += \`<div class="bar-item" \${canMap ? 'onclick="' + click + '" style="cursor:pointer"' : ""}>
       <span class="rank \${rankCls(idx)}">\${idx}</span>
-      <div class="bar-label \${cls}" onclick="\${click}">\${arrow}\${name}</div>
+      <div class="bar-label \${cls}">\${name}</div>
       <div class="bar-track"><div class="bar-fill" style="width:\${width}%"></div></div>
       <div class="bar-nums"><span class="bar-num">\${v.toLocaleString()}</span><span class="bar-pct">\${pct}%</span></div>
     </div>\`;
-
-    if (canExpand && regionExpanded) {
-      const pTotal = provinces.reduce((s, x) => s + x[1], 0) || 1;
-      provinces.forEach(([pn, pv]) => {
-        const pp = (pv / pTotal * 100).toFixed(1);
-        const pw = Math.max(3, (pv / maxP) * 100);
-        html += \`<div class="bar-item sub">
-          <div class="bar-label">\${pn}</div>
-          <div class="bar-track"><div class="bar-fill sub" style="width:\${pw}%"></div></div>
-          <div class="bar-nums"><span class="bar-num">\${pv.toLocaleString()}</span><span class="bar-pct">\${pp}%</span></div>
-        </div>\`;
-      });
-    }
   });
   list.innerHTML = html;
 }
 
-/** 切换省份展开 / 收起 */
-function toggleRegion() { regionExpanded = !regionExpanded; renderRegions(); }
-window.toggleRegion = toggleRegion;
+/** 打开地图弹窗 */
+function openMapModal(country) {
+  const modal = document.getElementById("mapModal");
+  document.getElementById("mapTitle").textContent = country + " 地区分布";
+  modal.classList.add("show");
+  document.getElementById("mapChart").innerHTML = '<div class="map-loading">加载中</div>';
+  if (country === "中国") {
+    loadChinaMap();
+  } else {
+    document.getElementById("mapChart").innerHTML = '<div class="map-empty">暂不支持该国家的地图展示<br>仅支持中国省份热力图</div>';
+  }
+}
+window.openMapModal = openMapModal;
+
+/** 关闭地图弹窗 */
+function closeMapModal() {
+  document.getElementById("mapModal").classList.remove("show");
+  if (window.mapChart) {
+    window.mapChart.dispose();
+    window.mapChart = null;
+  }
+}
+window.closeMapModal = closeMapModal;
+
+/** 加载中国省份热力图 */
+async function loadChinaMap() {
+  const chartDom = document.getElementById("mapChart");
+  try {
+    const res = await fetch("https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json");
+    if (!res.ok) throw new Error("地图数据加载失败");
+    const geoJson = await res.json();
+    echarts.registerMap("china", geoJson);
+
+    // 构建名称映射（支持简称）
+    const nameMap = {};
+    geoJson.features.forEach(f => {
+      const full = f.properties.name;
+      if (!full) return;
+      nameMap[full] = full;
+      const short = full.replace(/(省|市|自治区|特别行政区|维吾尔|回族|壮族)$/, "").replace(/(维吾尔|回族|壮族)/, "");
+      if (short && short !== full) nameMap[short] = full;
+    });
+
+    const raw = regionProvinces || [];
+    const data = raw.map(([n, v]) => {
+      let matched = nameMap[n] || nameMap[n + "省"] || nameMap[n + "市"] || nameMap[n + "自治区"] || n;
+      return { name: matched, value: v };
+    }).filter(d => d.name);
+
+    const maxVal = Math.max(...data.map(d => d.value), 1);
+    const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+
+    chartDom.innerHTML = "";
+    window.mapChart = echarts.init(chartDom, isDark ? "dark" : null);
+
+    const option = {
+      backgroundColor: "transparent",
+      tooltip: {
+        trigger: "item",
+        backgroundColor: isDark ? "#1e293b" : "#0f172a",
+        borderWidth: 0,
+        textStyle: { color: "#f8fafc", fontSize: 13 },
+        formatter: (p) => {
+          const v = p.value || 0;
+          const valText = v > 0 ? v.toLocaleString() : "暂无数据";
+          return '<div style="font-weight:600;margin-bottom:4px">' + p.name + '</div>请求数：<b>' + valText + '</b>';
+        }
+      },
+      visualMap: {
+        min: 0,
+        max: maxVal,
+        right: 16,
+        bottom: 20,
+        text: ["高", "低"],
+        calculable: true,
+        orient: "vertical",
+        itemWidth: 12,
+        itemHeight: 100,
+        inRange: {
+          color: isDark
+            ? ["#78350f", "#d97706", "#f59e0b", "#fbbf24"]
+            : ["#fef3c7", "#fde68a", "#f59e0b", "#d97706"]
+        },
+        textStyle: { color: isDark ? "#94a3b8" : "#64748b", fontSize: 11 },
+        borderColor: "transparent"
+      },
+      series: [{
+        name: "请求数",
+        type: "map",
+        map: "china",
+        roam: true,
+        zoom: 1.48,
+        center: [105, 35.8],
+        scaleLimit: { min: 0.8, max: 6 },
+        label: {
+          show: false,
+          fontSize: 10,
+          color: isDark ? "#e2e8f0" : "#334155"
+        },
+        emphasis: {
+          label: { show: true, color: "#fff", fontWeight: 600 },
+          itemStyle: { areaColor: "#f59e0b", borderColor: "#fff", borderWidth: 1.5 }
+        },
+        select: { disabled: true },
+        itemStyle: {
+          areaColor: isDark ? "#1e293b" : "#e2e8f0",
+          borderColor: isDark ? "#475569" : "#cbd5e1",
+          borderWidth: 1.1
+        },
+        data: data
+      }]
+    };
+    window.mapChart.setOption(option);
+    setTimeout(() => { if (window.mapChart) window.mapChart.resize(); }, 50);
+
+    // 窗口大小变化时自适应
+    const resize = () => window.mapChart && window.mapChart.resize();
+    window.addEventListener("resize", resize);
+    // 弹窗关闭时清理（简单处理）
+    const origClose = closeMapModal;
+    // 已在 close 中 dispose
+  } catch (e) {
+    chartDom.innerHTML = '<div class="map-empty">地图加载失败：' + (e.message || "未知错误") + '</div>';
+  }
+}
+
+// 点击遮罩或按 ESC 关闭
+document.getElementById("mapModal").addEventListener("click", e => {
+  if (e.target.id === "mapModal") closeMapModal();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && document.getElementById("mapModal").classList.contains("show")) {
+    closeMapModal();
+  }
+});
 
 // ==================== 图表工具 ====================
 
