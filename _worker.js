@@ -904,10 +904,61 @@ body{
 }
 .close{
   width:36px;height:36px;border-radius:12px;display:grid;place-items:center;
-  font-size:20px;line-height:1;cursor:pointer;color:var(--t2);
+  font-size:22px;line-height:1;cursor:pointer;color:var(--t2);
   background:transparent;transition:.18s;
 }
 .close:hover{background:var(--hover);color:var(--t);transform:rotate(90deg)}
+
+/* ========== 手机端地图弹窗适配 ==========
+ * 目标：不全屏，保留边距和圆角，同时保证地图有足够高度显示
+ * 注意：不要用 .modal-hd span { display:none }，否则会把关闭按钮一起隐藏
+ */
+@media (max-width:720px){
+  .modal{padding:12px}
+  .modal-content{
+    width:100% !important;
+    height:auto !important;
+    max-height:90vh !important;
+    border-radius:18px !important;
+    padding:12px !important;
+    display:flex !important;
+    flex-direction:column !important;
+  }
+  .modal-hd{
+    flex:none;
+    display:flex !important;
+    align-items:center;
+    justify-content:space-between;
+    margin-bottom:8px;
+    padding-bottom:8px;
+  }
+  .modal-hd h3{font-size:15px}
+  .modal-hd > div > span{display:none !important}
+  .close{
+    display:grid !important;
+    visibility:visible !important;
+    width:36px !important;
+    height:36px !important;
+    font-size:24px !important;
+    line-height:1 !important;
+    place-items:center;
+    color:var(--t) !important;
+    background:var(--hover) !important;
+    border-radius:10px !important;
+    position:static !important;
+    transform:none !important;
+    flex:none;
+    opacity:1 !important;
+  }
+  .close::before{content:none !important}
+  #mapChart{
+    flex:none !important;
+    height:62vh !important;
+    min-height:280px !important;
+    border-radius:12px !important;
+  }
+}
+
 #mapChart{
   flex:1;min-height:0;width:100%;
   border-radius:16px;
@@ -929,23 +980,6 @@ body{
   animation:spin .8s linear infinite;
 }
 @keyframes spin{to{transform:rotate(360deg)}}
-
-/* 手机端优化 */
-@media (max-width:720px){
-  .modal{padding:0}
-  .modal-content{
-    width:100%;height:100%;
-    max-width:none;max-height:none;
-    border-radius:0;
-    padding:12px 12px 8px;
-    border:none;
-  }
-  .modal-hd{margin-bottom:6px;padding-bottom:8px}
-  .modal-hd h3{font-size:16px}
-  .modal-hd span{display:none}
-  .close{width:40px;height:40px;font-size:22px}
-  #mapChart{border-radius:12px}
-}
 
 </style>
 </head>
@@ -1240,7 +1274,9 @@ function renderRegions() {
   list.innerHTML = html;
 }
 
-/** 打开地图弹窗 */
+/** 打开地图弹窗
+ * @param {string} country 国家名称，目前仅支持「中国」
+ */
 function openMapModal(country) {
   const modal = document.getElementById("mapModal");
   document.getElementById("mapTitle").textContent = country + " 地区分布";
@@ -1255,6 +1291,7 @@ function openMapModal(country) {
 window.openMapModal = openMapModal;
 
 /** 关闭地图弹窗 */
+/** 关闭地图弹窗，并销毁 ECharts 实例释放内存 */
 function closeMapModal() {
   document.getElementById("mapModal").classList.remove("show");
   if (window.mapChart) {
@@ -1264,7 +1301,12 @@ function closeMapModal() {
 }
 window.closeMapModal = closeMapModal;
 
-/** 加载中国省份热力图 */
+/** 加载中国省份热力图
+ * 1. 从阿里云 DataV 拉取省级 GeoJSON
+ * 2. 将上报的省份名称（支持简称）匹配到地图标准名称
+ * 3. 用橙黄色系 visualMap 按请求数着色
+ * 4. 手机端自动缩小默认缩放和图例尺寸
+ */
 async function loadChinaMap() {
   const chartDom = document.getElementById("mapChart");
   try {
@@ -1273,7 +1315,7 @@ async function loadChinaMap() {
     const geoJson = await res.json();
     echarts.registerMap("china", geoJson);
 
-    // 构建名称映射（支持简称）
+    // 构建名称映射：支持「广东」→「广东省」、「新疆」→「新疆维吾尔自治区」等简称
     const nameMap = {};
     geoJson.features.forEach(f => {
       const full = f.properties.name;
@@ -1308,16 +1350,17 @@ async function loadChinaMap() {
           return '<div style="font-weight:600;margin-bottom:4px">' + p.name + '</div>请求数：<b>' + valText + '</b>';
         }
       },
+      // 热力图配色：与地区分布卡片的橙黄色调保持一致
       visualMap: {
         min: 0,
         max: maxVal,
-        right: 16,
-        bottom: 20,
+        right: window.innerWidth < 720 ? 8 : 16,
+        bottom: window.innerWidth < 720 ? 12 : 20,
         text: ["高", "低"],
         calculable: true,
         orient: "vertical",
-        itemWidth: 12,
-        itemHeight: 100,
+        itemWidth: window.innerWidth < 720 ? 10 : 12,
+        itemHeight: window.innerWidth < 720 ? 80 : 100,
         inRange: {
           color: isDark
             ? ["#78350f", "#d97706", "#f59e0b", "#fbbf24"]
@@ -1331,7 +1374,7 @@ async function loadChinaMap() {
         type: "map",
         map: "china",
         roam: true,
-        zoom: 1.48,
+        zoom: window.innerWidth < 720 ? 1.15 : 1.48,
         center: [105, 35.8],
         scaleLimit: { min: 0.8, max: 6 },
         label: {
